@@ -1,67 +1,101 @@
-use crossterm::event::{Event, Event::Key, KeyCode::Char, KeyEvent, KeyModifiers, read};
+use crossterm::event::{read, Event, KeyEvent, KeyEventKind};
+use std::{
+    env,
+    io::Error,
+    panic::{set_hook, take_hook},
+};
+mod editorcommand;
 mod terminal;
-use std::io::Error;
-use terminal::{Position, Size, Terminal};
+mod view;
+use terminal::Terminal;
+use view::View;
+
+use editorcommand::EditorCommand;
+
 pub struct Editor {
     should_quit: bool,
+    view: View,
 }
+
 impl Editor {
-    pub const fn default() -> Self {
-        Editor { should_quit: false }
+    pub fn new() -> Result<Self, Error> {
+        let current_hook = take_hook();
+        set_hook(Box::new(move |panic_info| {
+            let _ = Terminal::terminate();
+            current_hook(panic_info);
+        }));
+        Terminal::initialize()?;
+        let mut view = View::default();
+        let args: Vec<String> = env::args().collect();
+        if let Some(file_name) = args.get(1) {
+            view.load(file_name);
+        }
+        Ok(Self {
+            should_quit: false,
+            view,
+        })
     }
     pub fn run(&mut self) {
-        Terminal::initialize().unwrap();
-        let result = self.repl();
-        Terminal::terminate().unwrap();
-        result.unwrap();
-    }
-    fn draw_rows() -> Result<(), Error> {
-        let Size { height, width } = Terminal::size()?;
-
-        for current_row in 0..height {
-            Terminal::clear_line()?;
-            Terminal::print("~")?;
-            if current_row < height {
-                Terminal::print("\r\n")?;
-            }
-        }
-        Ok(())
-    }
-    fn repl(&mut self) -> Result<(), Error> {
         loop {
-            self.refresh_screen()?;
+            self.refresh_screen();
             if self.should_quit {
                 break;
             }
-            let event = read()?;
-            self.evaluate_event(&event);
-        }
-        Ok(())
-    }
-    fn evaluate_event(&mut self, event: &Event) {
-        if let Key(KeyEvent {
-            code, modifiers, ..
-        }) = event
-        {
-            match code {
-                Char('q') if *modifiers == KeyModifiers::CONTROL => {
-                    self.should_quit = true;
+            match read() {
+                Ok(event) => self.evaluate_event(event),
+                Err(err) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        panic!("Could not read event: {err:?}");
+                    }
                 }
-                _ => (),
             }
         }
     }
-    fn refresh_screen(&self) -> Result<(), Error> {
-        if self.should_quit {
-            Terminal::hide_cursor()?;
-            Terminal::clear_screen()?;
-            Terminal::print("Goodbye.\r\n")?;
-        } else {
-            Self::draw_rows()?;
-            Terminal::move_cursor_to(Position { x: 0, y: 0 })?;
+
+    // needless_pass_by_value: Event is not huge, so there is not a
+    // performance overhead in passing by value, and pattern matching in this
+    // function would be needlessly complicated if we pass by reference here.
+    #[allow(clippy::needless_pass_by_value)]
+    fn evaluate_event(&mut self, event: Event) {
+        let should_process = match &event {
+            Event::Key(KeyEvent { kind, .. }) => kind == &KeyEventKind::Press,
+            Event::Resize(_, _) => true,
+            _ => false,
+        };
+
+        if should_process {
+            match EditorCommand::try_from(event) {
+                Ok(command) => {
+                    if matches!(command, EditorCommand::Quit) {
+                        self.should_quit = true;
+                    } else {
+                        self.view.handle_command(command);
+                    }
+                }
+                Err(err) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        panic!("Could not handle command: {err}");
+                    }
+                }
+            }
         }
-        Terminal::show_cursor()?;
-        Terminal::execute()?;
-        Ok(())
+    }
+    fn refresh_screen(&mut self) {
+        let _ = Terminal::hide_caret();
+        self.view.render();
+        let _ = Terminal::move_caret_to(self.view.caret_position());
+        let _ = Terminal::show_caret();
+        let _ = Terminal::execute();
+    }
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        let _ = Terminal::terminate();
+        if self.should_quit {
+            let _ = Terminal::print("Goodbye.\r\n");
+        }
     }
 }
